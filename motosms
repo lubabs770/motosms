@@ -38,6 +38,8 @@ mkdir -p "$STATE_DIR" "$DATA_DIR"
 : "${MAXCHARS:=3800}"
 : "${MMS_PORT:=8099}"
 : "${MMS_MAX_BYTES:=1000000}"
+: "${MMS_PKG:=com.lubabs770.motomms}"
+: "${MMS_REARM_MIN:=120}"   # seconds between re-arm attempts
 
 INBOX_JSONL="$DATA_DIR/inbox.jsonl"
 LOG="$DATA_DIR/motosms.log"
@@ -235,6 +237,7 @@ mms_get_binary() { phone "curl -s --max-time 120 'http://127.0.0.1:$MMS_PORT$1' 
 # stopped by any APK upgrade and nothing restarts it), so say so once per outage
 # rather than every tick. Text is unaffected — it needs no app.
 MMS_DOWN_FLAG="$STATE_DIR/mms-bridge-down"
+MMS_REARM_STAMP="$STATE_DIR/mms-rearm-at"
 mms_down() {
   [[ -e $MMS_DOWN_FLAG ]] && return 0
   : >"$MMS_DOWN_FLAG"
@@ -243,8 +246,33 @@ mms_down() {
 }
 mms_up() {
   [[ -e $MMS_DOWN_FLAG ]] || return 0
-  rm -f "$MMS_DOWN_FLAG"
+  rm -f "$MMS_DOWN_FLAG" "$MMS_REARM_STAMP"
   log "motomms bridge back up"
+}
+
+# Restart the phone-side app over adb when it has gone away.
+#
+# This is a watchdog, which killed the previous incarnation of this pipeline, so
+# it is scoped narrowly on purpose: the health check (/health) is exactly the
+# thing it repairs, it only ever restarts an app, and it never touches the
+# transport — no tailscale, no adb tcpip, no reboots. If adb is not attached it
+# does nothing and the outage stays logged for you to fix by hand.
+mms_rearm() {
+  [[ -n $ADB_SERIAL ]] || return 0
+  adb -s "$ADB_SERIAL" get-state 2>/dev/null | grep -q '^device$' || return 0
+
+  local now last=0
+  now=$(date +%s)
+  [[ -e $MMS_REARM_STAMP ]] && last=$(cat "$MMS_REARM_STAMP" 2>/dev/null || echo 0)
+  (( now - last < MMS_REARM_MIN )) && return 0
+  echo "$now" >"$MMS_REARM_STAMP"
+
+  log "re-arming motomms bridge over adb"
+  # -f 0x20 = FLAG_INCLUDE_STOPPED_PACKAGES; a force-stopped app is exactly the
+  # case we are recovering from, and broadcasts are dropped to it otherwise.
+  adb -s "$ADB_SERIAL" shell am broadcast -a "$MMS_PKG.START" \
+      -n "$MMS_PKG/.BootReceiver" -f 0x20 >/dev/null 2>&1 ||
+    log "re-arm broadcast failed"
 }
 
 # Polls the MMS provider for messages newer than last-mms-id, saves each image
@@ -257,14 +285,14 @@ mms_poll() {
   # First run: adopt the current max so old picture threads are not replayed.
   if [[ -z $last ]]; then
     last=$(mms_get /health 2>/dev/null | jq -r '.maxMmsId // empty' 2>/dev/null)
-    [[ $last =~ ^[0-9]+$ ]] || { mms_down; return 0; }
+    [[ $last =~ ^[0-9]+$ ]] || { mms_down; mms_rearm; return 0; }
     echo "$last" >"$LAST_MMS_FILE"
     log "watch: mms baseline id=$last"
     return 0
   fi
 
   batch=$(mms_get "/mms/list?since=$last&limit=10" 2>/dev/null)
-  jq -e '.ok == true' >/dev/null 2>&1 <<<"$batch" || { mms_down; return 0; }
+  jq -e '.ok == true' >/dev/null 2>&1 <<<"$batch" || { mms_down; mms_rearm; return 0; }
   mms_up
   [[ $(jq '.messages | length' <<<"$batch") -gt 0 ]] || return 0
 
