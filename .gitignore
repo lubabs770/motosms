@@ -1,0 +1,9 @@
+# Device-specific and secret. Never commit: these carry the phone's adb serial,
+# LAN/tailnet addresses and the allow-listed phone number.
+env
+allow
+
+# Runtime artefacts, if anything ever lands in the working dir
+*.log
+*.jpg
+*.png

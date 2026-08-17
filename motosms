@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+# motosms — SMS bridge to the Moto G7 over Termux + ssh.
+#
+#   motosms send <number> [text...]   # text may also come on stdin
+#   motosms mms <number> <file> [caption...]  # picture, via the motomms app
+#   motosms list [n]                  # last n inbox messages (JSON)
+#   motosms watch                     # poll inbox, dispatch new msgs to handler
+#   motosms status                    # transport + phone health
+#   motosms tail [n]                  # human log
+#
+# No daemon runs on the phone: ssh is the transport and the authentication.
+# Transport is chosen per-call — USB (adb forward) first, then tailnet, then LAN.
+
+set -uo pipefail
+
+# Config lives beside this script, not in ~/.config. Resolve through the symlink
+# in ~/.local/bin so MOTOSMS_HOME stays correct however it was invoked.
+MOTOSMS_HOME="${MOTOSMS_HOME:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/motosms"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/motosms"
+ENV_FILE="$MOTOSMS_HOME/env"
+ALLOW_FILE="$MOTOSMS_HOME/allow"
+HANDLER="$MOTOSMS_HOME/on-received"
+
+mkdir -p "$STATE_DIR" "$DATA_DIR"
+# shellcheck source=/dev/null
+[[ -r $ENV_FILE ]] && . "$ENV_FILE"
+
+: "${PHONE_USER:=}"   # set in ./env — the Termux app uid, e.g. u0_aNNN
+: "${PHONE_PORT:=8022}"
+: "${PHONE_TAILNET:=}"
+: "${PHONE_LAN:=}"
+: "${ADB_SERIAL:=}"
+: "${ADB_LOCAL_PORT:=18022}"
+: "${POLL_MIN:=5}"
+: "${POLL_MAX:=60}"
+: "${POLL_DECAY:=16}"
+: "${MAXCHARS:=3800}"
+: "${MMS_PORT:=8099}"
+: "${MMS_MAX_BYTES:=1000000}"
+
+INBOX_JSONL="$DATA_DIR/inbox.jsonl"
+LOG="$DATA_DIR/motosms.log"
+LAST_ID_FILE="$STATE_DIR/last-id"
+LAST_MMS_FILE="$STATE_DIR/last-mms-id"
+TRANSPORT_FILE="$STATE_DIR/transport"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+die() { printf 'motosms: %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- transport --
+
+ssh_opts=(
+  -o BatchMode=yes
+  -o ConnectTimeout=6
+  -o StrictHostKeyChecking=accept-new
+  -o ControlMaster=auto
+  -o "ControlPath=$STATE_DIR/ssh-%C"
+  -o ControlPersist=180
+)
+
+# Echoes "<host> <port> <label>" for the first transport that answers.
+resolve_transport() {
+  if [[ -n $ADB_SERIAL ]] &&
+     adb -s "$ADB_SERIAL" get-state 2>/dev/null | grep -q '^device$'; then
+    if adb -s "$ADB_SERIAL" forward "tcp:$ADB_LOCAL_PORT" "tcp:$PHONE_PORT" >/dev/null 2>&1 &&
+       probe localhost "$ADB_LOCAL_PORT"; then
+      echo "localhost $ADB_LOCAL_PORT usb"; return 0
+    fi
+  fi
+  if [[ -n $PHONE_TAILNET ]] && probe "$PHONE_TAILNET" "$PHONE_PORT"; then
+    echo "$PHONE_TAILNET $PHONE_PORT tailnet"; return 0
+  fi
+  if [[ -n $PHONE_LAN ]] && probe "$PHONE_LAN" "$PHONE_PORT"; then
+    echo "$PHONE_LAN $PHONE_PORT lan"; return 0
+  fi
+  return 1
+}
+
+probe() { timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
+# phone <remote command...> — runs it in the Termux shell, stdin passed through.
+phone() {
+  local t host port label
+  [[ -n $PHONE_USER ]] || die "PHONE_USER is unset; set it in $ENV_FILE"
+  t=$(resolve_transport) || { log "no transport"; return 69; }
+  read -r host port label <<<"$t"
+  echo "$label" >"$TRANSPORT_FILE"
+  ssh "${ssh_opts[@]}" -p "$port" "$PHONE_USER@$host" "$@"
+}
+
+# ------------------------------------------------------------------- gsm7 ----
+
+# This carrier cannot send UCS-2 at all: a single non-GSM-7 character silently
+# fails the whole message. Fold everything down to plain ASCII (a GSM-7 subset),
+# minus the backtick, which GSM-7 does not have.
+gsm7() {
+  sed -e 's/[‘’‛]/'"'"'/g' \
+      -e 's/[“”]/"/g' \
+      -e 's/[–—−]/-/g' \
+      -e 's/…/.../g' \
+      -e 's/[•·]/*/g' \
+      -e 's/→/->/g' \
+      -e 's/ / /g' \
+      -e 's/`/'"'"'/g' |
+  sed -e 'y/àáâãäåÀÁÂÃÄÅ/aaaaaaAAAAAA/' \
+      -e 'y/èéêëÈÉÊË/eeeeEEEE/' \
+      -e 'y/ìíîïÌÍÎÏ/iiiiIIII/' \
+      -e 'y/òóôõöÒÓÔÕÖ/oooooOOOOO/' \
+      -e 'y/ùúûüÙÚÛÜ/uuuuUUUU/' \
+      -e 'y/ñÑçÇýÿÝ/nNcCyyY/' \
+      -e 's/ß/ss/g' -e 's/æ/ae/g' -e 's/Æ/AE/g' -e 's/ø/o/g' -e 's/Ø/O/g' |
+  iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null |
+  tr -cd '\11\12\40-\176'
+}
+
+# ------------------------------------------------------------- allow-list ----
+
+last10() { printf '%s' "$1" | tr -cd '0-9' | tail -c 10; }
+
+allowed() {
+  local want; want=$(last10 "$1")
+  [[ -n $want ]] || return 1
+  [[ -r $ALLOW_FILE ]] || return 1   # fail closed
+  local line
+  while IFS= read -r line; do
+    line=${line%%#*}
+    line=$(printf '%s' "$line" | tr -d '[:space:]')
+    [[ -z $line ]] && continue
+    [[ $(last10 "$line") == "$want" ]] && return 0
+  done <"$ALLOW_FILE"
+  return 1
+}
+
+# --------------------------------------------------------------- commands ----
+
+cmd_send() {
+  local number=${1:-}; shift || true
+  [[ -n $number ]] || die "usage: motosms send <number> [text...]"
+  [[ $number =~ ^\+?[0-9]+$ ]] || die "bad number: $number"
+
+  local text
+  if (($#)); then text="$*"; else text=$(cat); fi
+  text=$(printf '%s' "$text" | gsm7)
+  [[ -n $text ]] || die "empty message after GSM-7 filtering"
+
+  if ((${#text} > MAXCHARS)); then
+    log "truncating ${#text} -> $MAXCHARS chars"
+    text=${text:0:MAXCHARS}
+  fi
+
+  # termux-sms-send reads the body from stdin when no text argument is given,
+  # which keeps the message out of the remote command line entirely.
+  if printf '%s' "$text" | phone "termux-sms-send -n '$number'"; then
+    log "sent to $number (${#text} chars)"
+    printf 'sent to %s (%d chars, via %s)\n' \
+      "$number" "${#text}" "$(cat "$TRANSPORT_FILE" 2>/dev/null || echo '?')"
+  else
+    local rc=$?
+    log "SEND FAILED to $number rc=$rc"
+    die "send failed (rc=$rc)"
+  fi
+}
+
+cmd_list() {
+  local n=${1:-10}
+  phone "termux-sms-list -l $n -t inbox"
+}
+
+# motosms mms <number> <image-file> [caption...]
+#
+# Pictures go through the motomms app on the phone (loopback HTTP on 8099), not
+# through termux-sms-send, which is text-only. Piping the file into a curl that
+# runs *on the phone* means this works over whichever transport phone() picked —
+# USB or tailnet — with no second port to forward.
+cmd_mms() {
+  local number=${1:-} file=${2:-}
+  [[ -n $number && -n $file ]] || die "usage: motosms mms <number> <image-file> [caption...]"
+  [[ $number =~ ^\+?[0-9]+$ ]] || die "bad number: $number"
+  [[ -r $file ]] || die "cannot read $file"
+  shift 2
+  local caption="$*"
+
+  local mime; mime=$(file -b --mime-type "$file")
+  case "$mime" in
+    image/*) ;;
+    *) die "not an image: $file is $mime" ;;
+  esac
+
+  # Carrier hard-caps a message at 1 MB; shrink rather than let it fail silently.
+  local send_file=$file
+  local size; size=$(stat -c %s "$file")
+  if (( size > MMS_MAX_BYTES )); then
+    command -v magick >/dev/null || die "$file is $size bytes (cap $MMS_MAX_BYTES) and magick is not installed to shrink it"
+    send_file="$STATE_DIR/mms-resized.jpg"
+    magick "$file" -resize '2592x1944>' -quality 80 "$send_file" 2>/dev/null ||
+      die "failed to resize $file"
+    mime=image/jpeg
+    log "resized $file ($size bytes) -> $(stat -c %s "$send_file") bytes"
+  fi
+
+  local q="to=$(urlenc "$number")"
+  [[ -n $caption ]] && q="$q&text=$(urlenc "$(printf '%s' "$caption" | gsm7)")"
+
+  local out
+  out=$(phone "curl -s --max-time 180 -X POST --data-binary @- -H 'Content-Type: $mime' 'http://127.0.0.1:$MMS_PORT/mms/send?$q'" <"$send_file")
+
+  if [[ -z $out ]]; then
+    log "MMS FAILED to $number (no response; is the motomms bridge running?)"
+    die "no response from the motomms bridge on the phone (port $MMS_PORT)"
+  fi
+  if ! jq -e '.ok == true' >/dev/null 2>&1 <<<"$out"; then
+    log "MMS FAILED to $number: $out"
+    die "mms send failed: $(jq -r '.detail // .error // .' <<<"$out" 2>/dev/null || printf '%s' "$out")"
+  fi
+
+  log "mms sent to $number ($(stat -c %s "$send_file") bytes)"
+  printf 'mms sent to %s (%s bytes, via %s)\n' \
+    "$number" "$(stat -c %s "$send_file")" "$(cat "$TRANSPORT_FILE" 2>/dev/null || echo '?')"
+}
+
+urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
+
+# ------------------------------------------------------- inbound pictures ----
+
+# GET against the motomms bridge, executed on the phone so it rides whatever
+# transport phone() resolved.
+mms_get() { phone "curl -s --max-time 60 'http://127.0.0.1:$MMS_PORT$1'"; }
+
+# Same, but base64 on the phone and decode here — ssh is a text channel and raw
+# JPEG bytes through it are asking for trouble.
+mms_get_binary() { phone "curl -s --max-time 120 'http://127.0.0.1:$MMS_PORT$1' | base64 -w0" | base64 -d; }
+
+# Polls the MMS provider for messages newer than last-mms-id, saves each image
+# part under $DATA_DIR/media/<mmsid>/, and dispatches one envelope per message
+# in the same shape as an SMS (plus a "media" array of local paths).
+mms_poll() {
+  local last batch
+  last=$(cat "$LAST_MMS_FILE" 2>/dev/null || echo "")
+
+  # First run: adopt the current max so old picture threads are not replayed.
+  if [[ -z $last ]]; then
+    last=$(mms_get /health 2>/dev/null | jq -r '.maxMmsId // empty' 2>/dev/null)
+    [[ $last =~ ^[0-9]+$ ]] || return 0        # bridge down; try again next tick
+    echo "$last" >"$LAST_MMS_FILE"
+    log "watch: mms baseline id=$last"
+    return 0
+  fi
+
+  batch=$(mms_get "/mms/list?since=$last&limit=10" 2>/dev/null)
+  jq -e '.ok == true' >/dev/null 2>&1 <<<"$batch" || return 0
+  [[ $(jq '.messages | length' <<<"$batch") -gt 0 ]] || return 0
+
+  local m id from text dir paths ext out pid ct new_max=$last
+  while IFS= read -r m; do
+    [[ -n $m ]] || continue
+    id=$(jq -r '.id' <<<"$m")
+    from=$(jq -r '.from // ""' <<<"$m")
+    text=$(jq -r '.text // ""' <<<"$m")
+
+    dir="$DATA_DIR/media/$id"
+    mkdir -p "$dir"
+    paths=()
+    while IFS=$'\t' read -r pid ct; do
+      [[ -n $pid ]] || continue
+      case "$ct" in
+        image/png) ext=png ;;
+        image/gif) ext=gif ;;
+        image/*)   ext=jpg ;;
+        *)         ext=bin ;;
+      esac
+      out="$dir/$pid.$ext"
+      if mms_get_binary "/mms/part/$pid" >"$out" 2>/dev/null && [[ -s $out ]]; then
+        paths+=("$out")
+        log "mms $id: saved part $pid ($ct, $(stat -c %s "$out") bytes)"
+      else
+        rm -f "$out"
+        log "mms $id: FAILED to fetch part $pid"
+      fi
+    done < <(jq -r '.parts[]? | "\(.id)\t\(.ct)"' <<<"$m")
+
+    local media_json
+    media_json=$(printf '%s\n' "${paths[@]:-}" | jq -R . | jq -sc 'map(select(. != ""))')
+
+    local envelope
+    envelope=$(jq -nc --arg num "$from" --arg body "$text" \
+                     --argjson id "$id" --argjson media "$media_json" \
+                     '{number:$num, address:$num, body:$body, _id:$id, type:"mms", media:$media}')
+
+    printf '%s\n' "$envelope" >>"$INBOX_JSONL"
+    printf '%s  <%s>  [mms %s image(s)] %s\n' \
+      "$(date '+%F %T')" "$from" "$(jq -r '.media|length' <<<"$envelope")" "$text" \
+      >>"$DATA_DIR/received.log"
+
+    if allowed "$from"; then
+      [[ -x $HANDLER ]] && { printf '%s\n' "$envelope" | "$HANDLER" >>"$LOG" 2>&1 || log "handler rc=$? for mms $id"; }
+    else
+      log "DROPPED mms (not allow-listed): $from"
+    fi
+
+    ((id > new_max)) && new_max=$id
+  done < <(jq -c '.messages[]' <<<"$batch")
+
+  ((new_max > last)) && echo "$new_max" >"$LAST_MMS_FILE"
+  return 0
+}
+
+cmd_status() {
+  local t
+  if t=$(resolve_transport); then
+    read -r host port label <<<"$t"
+    printf 'transport : %s (%s:%s)\n' "$label" "$host" "$port"
+  else
+    printf 'transport : UNREACHABLE\n'; return 1
+  fi
+  printf 'last id   : %s\n' "$(cat "$LAST_ID_FILE" 2>/dev/null || echo '-')"
+  printf 'battery   : %s\n' \
+    "$(phone 'termux-battery-status 2>/dev/null' | jq -r '"\(.percentage)% \(.status)"' 2>/dev/null || echo '?')"
+  printf 'allow     : %s entries\n' \
+    "$(grep -cvE '^\s*(#|$)' "$ALLOW_FILE" 2>/dev/null || echo 0)"
+  printf 'handler   : %s\n' \
+    "$([[ -x $HANDLER ]] && echo "$HANDLER" || echo 'none (messages only logged)')"
+}
+
+cmd_tail() { tail -n "${1:-20}" "$DATA_DIR/received.log" 2>/dev/null; }
+
+cmd_watch() {
+  local interval=$POLL_MIN last_id
+  last_id=$(cat "$LAST_ID_FILE" 2>/dev/null || echo "")
+
+  # First ever run: adopt the current newest id so old texts are not replayed.
+  if [[ -z $last_id ]]; then
+    last_id=$(phone 'termux-sms-list -l 1 -t inbox' | jq -r '.[0]._id // 0' 2>/dev/null)
+    [[ $last_id =~ ^[0-9]+$ ]] || last_id=0
+    echo "$last_id" >"$LAST_ID_FILE"
+    log "watch: baseline id=$last_id"
+  fi
+
+  log "watch: started"
+  while :; do
+    local batch new_max=0
+    batch=$(phone 'termux-sms-list -l 25 -t inbox' 2>/dev/null)
+
+    if [[ -n $batch ]] && jq -e . >/dev/null 2>&1 <<<"$batch"; then
+      local fresh
+      fresh=$(jq -c --argjson last "$last_id" \
+        '[.[] | select(._id > $last)] | sort_by(._id) | .[]' <<<"$batch")
+
+      if [[ -n $fresh ]]; then
+        while IFS= read -r msg; do
+          [[ -n $msg ]] || continue
+          printf '%s\n' "$msg" >>"$INBOX_JSONL"
+          dispatch "$msg"
+          local id; id=$(jq -r '._id' <<<"$msg")
+          ((id > new_max)) && new_max=$id
+        done <<<"$fresh"
+
+        ((new_max > last_id)) && { last_id=$new_max; echo "$last_id" >"$LAST_ID_FILE"; }
+        interval=$POLL_MIN            # burst mode: something is happening
+      else
+        # decay back toward idle so a quiet phone is cheap to watch
+        interval=$(( interval * POLL_DECAY / 10 ))
+        ((interval > POLL_MAX)) && interval=$POLL_MAX
+      fi
+    else
+      log "watch: poll failed (transport down?)"
+      interval=$POLL_MAX
+    fi
+
+    # Pictures ride a separate provider with its own id space, so it needs its
+    # own high-water mark; the ssh ControlMaster makes the extra call cheap.
+    mms_poll
+
+    sleep "$interval"
+  done
+}
+
+dispatch() {
+  local msg=$1 from body
+  from=$(jq -r '.number // .address // ""' <<<"$msg")
+  body=$(jq -r '.body // ""' <<<"$msg")
+
+  printf '%s  <%s>  %s\n' "$(date '+%F %T')" "$from" "$body" >>"$DATA_DIR/received.log"
+
+  if ! allowed "$from"; then
+    log "DROPPED (not allow-listed): $from"
+    return 0
+  fi
+
+  if [[ -x $HANDLER ]]; then
+    printf '%s\n' "$msg" | "$HANDLER" >>"$LOG" 2>&1 ||
+      log "handler rc=$? for msg from $from"
+  fi
+}
+
+# ------------------------------------------------------------------- main ----
+
+case "${1:-}" in
+  send)   shift; cmd_send "$@" ;;
+  mms)    shift; cmd_mms "$@" ;;
+  gsm7)   shift; if (($#)); then printf '%s' "$*"; else cat; fi | gsm7; echo ;;
+  list)   shift; cmd_list "$@" ;;
+  watch)  shift; cmd_watch "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  tail)   shift; cmd_tail "$@" ;;
+  ""|-h|--help|help)
+    sed -n '2,13p' "$0" | sed 's/^# \?//' ;;
+  *) die "unknown command: $1 (try: send mms list watch status tail gsm7)" ;;
+esac

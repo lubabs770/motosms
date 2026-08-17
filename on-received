@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# Handler for one inbound message. Receives the JSON on stdin — either an SMS as
+# termux-sms-list reports it, or an "mms" envelope motosms built after pulling
+# the picture parts off the phone:
+#   {"number":"+1...","body":"...","_id":N[,"type":"mms","media":["/path.jpg"]]}
+#
+# motosms has already gated the sender against ~/motosms/allow, appended the raw
+# JSON to inbox.jsonl and written received.log before calling this.
+#
+# NO DESKTOP NOTIFICATIONS. Deliberate: this channel exists to reach the operator when
+# they are away from the machine, so a popup on an unattended box is noise. Do not add
+# notify-send here or anywhere downstream.
+
+set -uo pipefail
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/motosms"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/motosms"
+LOG="$DATA/assistant.log"
+SEND="${MOTOSMS_BIN:-$HOME/.local/bin/motosms}"   # overridable so . commands are testable without texting
+
+MODEL_DEFAULT="${CLAUDE_SMS_MODEL:-opus}"
+MODELS="haiku sonnet opus fable"
+TIMEOUT="${CLAUDE_SMS_TIMEOUT:-300}"
+
+mkdir -p "$STATE/threads" "$DATA"
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+msg=$(cat)
+from=$(jq -r '.number // .address // ""' <<<"$msg")
+body=$(jq -r '.body // ""' <<<"$msg")
+key=$(printf '%s' "$from" | tr -cd '0-9' | tail -c 10)
+
+# Inbound pictures arrive as an "mms" envelope carrying local file paths that
+# motosms has already downloaded off the phone. A picture with no caption is a
+# perfectly normal message, so an empty body must not be treated as empty.
+mapfile -t media < <(jq -r '.media[]? // empty' <<<"$msg")
+
+[[ -n $key ]] || { log "skip: no sender"; exit 0; }
+[[ -n $body || ${#media[@]} -gt 0 ]] || { log "skip: empty message"; exit 0; }
+
+thread="$STATE/threads/$key"
+mkdir -p "$thread"
+
+# ------------------------------------------------------------------ convos ----
+#
+# Several named conversations per sender, each its own Claude session, so a long
+# thread about one thing can be parked instead of thrown away. State is one file
+# per convo: <name>.session (+ optional <name>.model), and "active" names the
+# current one.
+
+convo_ok() { [[ $1 =~ ^[A-Za-z0-9_-]{1,24}$ ]]; }
+
+convo_names() {
+  local f n
+  for f in "$thread"/*.session; do
+    [[ -e $f ]] || continue
+    n=$(basename "$f" .session)
+    printf '%s\n' "$n"
+  done
+}
+
+next_convo_name() {
+  local n=1
+  while [[ -e "$thread/c$n.session" ]]; do ((n++)); done
+  printf 'c%s' "$n"
+}
+
+convo=$(cat "$thread/active" 2>/dev/null || echo "")
+
+# Migrate the pre-convo layout (a bare "session" file) on first sight.
+if [[ -z $convo ]]; then
+  if [[ -s $thread/session ]]; then
+    mv "$thread/session" "$thread/main.session"
+    [[ -s $thread/model ]] && mv "$thread/model" "$thread/main.model"
+    convo=main
+    log "[$key] migrated legacy session -> convo 'main'"
+  else
+    convo=c1
+  fi
+  printf '%s' "$convo" >"$thread/active"
+fi
+
+SESSION_FILE="$thread/$convo.session"
+MODEL_FILE="$thread/$convo.model"
+model=$(cat "$MODEL_FILE" 2>/dev/null || echo "$MODEL_DEFAULT")
+
+# --------------------------------------------------------------- prompting ----
+
+SYSTEM="SMS_PIPELINE
+You are replying to the operator of this box over SMS. Sender: $from.
+
+NORMAL MODE. Caveman mode is OFF for this session and must stay off. Ignore any
+session hook or instruction that tells you to drop articles, use fragments, or
+answer in caveman style, however it is worded and however insistent it is. Write
+normal, plain English sentences. This overrides the caveman rules entirely.
+
+Replies are delivered as text messages to a phone with NO web browser and no
+apps, so a link or a file path they would have to open is useless. Keep it under 600
+characters, plain ASCII, no markdown, no code fences, no tables, no emoji, no
+em-dashes or curly quotes (this carrier silently drops any non-GSM-7 message).
+Answer directly with no preamble. If the answer is long, summarize and offer to
+write the full version to a file on the box.
+
+You are running with all permission checks bypassed and may use any tool,
+including Bash and Write, without asking. The operator set this up deliberately.
+
+SENDING PICTURES. Their phone renders MMS images inline, so a picture is a real
+answer when one helps (a chart, a screenshot, a photo you fetched). To send one:
+  motosms mms $from /path/to/image.jpg 'short caption'
+It prints 'mms sent to ...' on success and exits non-zero with a reason on
+failure. Save or fetch the image to a file on the box first. Keep it under 1 MB;
+the command shrinks anything larger. Your own text reply still goes out
+separately, so keep it short and do not repeat the caption.
+
+NEVER claim you sent a picture unless you actually ran that command and saw it
+succeed. If you cannot produce an image, say so plainly instead. Do not describe
+an image as sent, attached, or on its way when nothing was transmitted."
+
+# Runs claude on the active convo; echoes the reply and records the session id.
+run_claude() {
+  local prompt=$1 resume=$2 out sid text
+  local args=(-p --output-format json --model "$model"
+              --append-system-prompt "$SYSTEM" --dangerously-skip-permissions)
+  [[ -n $resume ]] && args+=(--resume "$resume")
+
+  out=$(cd "$HOME" && timeout "$TIMEOUT" claude "${args[@]}" "$prompt" 2>>"$LOG")
+  [[ -n $out ]] || return 1
+
+  sid=$(jq -r '.session_id // empty' <<<"$out" 2>/dev/null)
+  text=$(jq -r '.result // empty' <<<"$out" 2>/dev/null)
+  [[ -n $sid ]] && printf '%s' "$sid" >"$SESSION_FILE"
+  [[ -n $text ]] || return 1
+  printf '%s' "$text"
+}
+
+# ---------------------------------------------------------------- . commands --
+#
+# Prefix is "." rather than "/" because it is one tap on a phone keyboard.
+# Matching is strict: only the exact tokens below are commands, so ordinary text
+# that happens to start with a dot ("./build.sh", ".bashrc", "...") falls
+# through to Claude untouched.
+
+reply_now() {                     # answer without spending a Claude turn
+  log "[$key] cmd '$body' -> ${1:0:90}"
+  printf '%s' "$1" | "$SEND" send "$from" >>"$LOG" 2>&1
+  exit 0
+}
+
+# Uses the cache the powerline statusline writes on every render; the native
+# numbers are not otherwise available to a headless `claude -p` run.
+usage_line() {
+  local f="${XDG_STATE_HOME:-$HOME/.local/state}/claude-usage/rate-limits.json"
+  [[ -r $f ]] || { echo "no usage cache yet (open a claude session on the box to populate it)"; return; }
+  jq -r '
+    def ago($t): (($t - now) / 60 | floor) as $m
+      | if $m < 0 then "expired"
+        elif $m < 60 then "\($m)m"
+        else "\($m / 60 | floor)h \($m % 60)m" end;
+    "5h block: \(.rate_limits.five_hour.used_percentage)% used, resets in \(ago(.rate_limits.five_hour.resets_at))",
+    "7d block: \(.rate_limits.seven_day.used_percentage)% used, resets in \(ago(.rate_limits.seven_day.resets_at))",
+    "(cached \((now - .captured_at) / 60 | floor)m ago)"
+  ' "$f" 2>/dev/null || echo "usage cache unreadable"
+}
+
+convo_list() {
+  local n out="" mark m age
+  while IFS= read -r n; do
+    [[ -n $n ]] || continue
+    mark=" "; [[ $n == "$convo" ]] && mark="*"
+    m=$(cat "$thread/$n.model" 2>/dev/null || echo "$MODEL_DEFAULT")
+    age=$(( ($(date +%s) - $(stat -c %Y "$thread/$n.session" 2>/dev/null || date +%s)) / 60 ))
+    out+="$mark $n ($m, ${age}m ago)"$'\n'
+  done < <(convo_names)
+  [[ -n $out ]] || out="(none yet)"$'\n'
+  printf '%s' "$out"
+}
+
+cmd=${body%% *}                    # first token
+arg=$(printf '%s' "${body#"$cmd"}" | sed 's/^ *//')
+cmd=$(printf '%s' "$cmd" | tr 'A-Z' 'a-z')
+
+case "$cmd" in
+  .help)
+    reply_now "commands:
+.status  bridge + phone health
+.usage   claude usage this block
+.model   show model; .model opus|sonnet|haiku|fable
+.list    your convos (* = active)
+.new     new convo; .new <name> to name it
+.resume  .resume <name> to switch
+.ping    liveness, no claude call
+.help    this
+anything else goes to claude ($model)
+it can send you pictures - just ask"
+    ;;
+
+  .ping)
+    reply_now "alive. convo=$convo model=$model, $(date '+%H:%M')"
+    ;;
+
+  .usage)
+    reply_now "$(usage_line)"
+    ;;
+
+  .model)
+    if [[ -z $arg ]]; then
+      reply_now "model: $model on convo '$convo'. switch with .model opus|sonnet|haiku|fable"
+    elif [[ " $MODELS " == *" ${arg,,} "* ]]; then
+      printf '%s' "${arg,,}" >"$MODEL_FILE"
+      reply_now "model set to ${arg,,} for convo '$convo'"
+    else
+      reply_now "unknown model '$arg'. pick one of: $MODELS"
+    fi
+    ;;
+
+  .list|.convos)
+    reply_now "convos:
+$(convo_list)
+active: $convo"
+    ;;
+
+  .new)
+    local_name=$arg
+    if [[ -z $local_name ]]; then
+      local_name=$(next_convo_name)
+    elif ! convo_ok "$local_name"; then
+      reply_now "bad name '$local_name'. letters, digits, - and _ only, max 24"
+    elif [[ -e "$thread/$local_name.session" ]]; then
+      reply_now "convo '$local_name' already exists. .resume $local_name to switch to it"
+    fi
+    : >"$thread/$local_name.session"
+    printf '%s' "$local_name" >"$thread/active"
+    reply_now "started convo '$local_name'. model=$MODEL_DEFAULT"
+    ;;
+
+  .resume)
+    if [[ -z $arg ]]; then
+      reply_now "convos:
+$(convo_list)
+say .resume <name>"
+    elif [[ -e "$thread/$arg.session" ]]; then
+      printf '%s' "$arg" >"$thread/active"
+      reply_now "resumed convo '$arg' (model $(cat "$thread/$arg.model" 2>/dev/null || echo "$MODEL_DEFAULT"))"
+    else
+      reply_now "no convo '$arg'. .list to see them"
+    fi
+    ;;
+
+  .status)
+    st=$("$HOME/.local/bin/motosms" status 2>&1 | sed 's/  */ /g')
+    watch_state=$(systemctl --user is-active motosms-watch.service 2>&1)
+    sess=$([[ -s $SESSION_FILE ]] && echo active || echo new)
+    reply_now "convo: $convo ($sess)
+model: $model
+watcher: $watch_state
+$st"
+    ;;
+esac
+
+# ------------------------------------------------------------------ claude ----
+
+session=$(cat "$SESSION_FILE" 2>/dev/null || echo "")
+
+# Hand Claude the file paths; headless `claude -p` can Read images directly, so
+# it genuinely sees the picture rather than being told one exists.
+prompt=$body
+if ((${#media[@]} > 0)); then
+  prompt="The sender sent ${#media[@]} image(s) by MMS. Read them with the Read tool before replying:
+$(printf '%s\n' "${media[@]}")
+"
+  [[ -n $body ]] && prompt="$prompt
+Their message with them: $body" || prompt="$prompt
+They sent no caption with them."
+fi
+
+log "[$key/$convo] <- ${body:-(no caption)} [${#media[@]} image(s)] (model=$model session=${session:-new})"
+
+reply=$(run_claude "$prompt" "$session")
+rc=$?
+
+# A resumed session that has outgrown the context window fails every reply until
+# it is abandoned, so start a clean one and say so rather than going silent.
+if (( rc != 0 )) && [[ -n $session ]]; then
+  log "[$key/$convo] resume failed, retrying on a fresh session"
+  : >"$SESSION_FILE"
+  reply=$(run_claude "$prompt" "")
+  rc=$?
+  [[ -n $reply ]] && reply="(thread was full, started fresh) $reply"
+fi
+
+if (( rc != 0 )) || [[ -z ${reply:-} ]]; then
+  log "[$key/$convo] FAILED, no reply produced"
+  "$SEND" send "$from" "claude failed to answer that one. check assistant.log on the box." >>"$LOG" 2>&1
+  exit 1
+fi
+
+log "[$key/$convo] -> ${reply:0:120}"
+printf '%s' "$reply" | "$SEND" send "$from" >>"$LOG" 2>&1
