@@ -40,6 +40,7 @@ mkdir -p "$STATE_DIR" "$DATA_DIR"
 : "${MMS_MAX_BYTES:=1000000}"
 : "${MMS_PKG:=com.lubabs770.motomms}"
 : "${MMS_REARM_MIN:=120}"   # seconds between re-arm attempts
+: "${ADB_LAN:=}"           # host:port for adb-over-tcp, so re-arm survives unplugging
 
 INBOX_JSONL="$DATA_DIR/inbox.jsonl"
 LOG="$DATA_DIR/motosms.log"
@@ -257,9 +258,27 @@ mms_up() {
 # thing it repairs, it only ever restarts an app, and it never touches the
 # transport — no tailscale, no adb tcpip, no reboots. If adb is not attached it
 # does nothing and the outage stays logged for you to fix by hand.
+# Echoes an adb target that is actually reachable: the USB serial if the cable
+# is in, else the LAN adb endpoint. adb tcpip does NOT survive a reboot on
+# Android 9, so the LAN path is a bonus, never something to rely on.
+adb_target() {
+  if [[ -n $ADB_SERIAL ]] &&
+     adb -s "$ADB_SERIAL" get-state 2>/dev/null | grep -q '^device$'; then
+    printf '%s' "$ADB_SERIAL"; return 0
+  fi
+  if [[ -n $ADB_LAN ]]; then
+    adb -s "$ADB_LAN" get-state 2>/dev/null | grep -q '^device$' ||
+      adb connect "$ADB_LAN" >/dev/null 2>&1
+    if adb -s "$ADB_LAN" get-state 2>/dev/null | grep -q '^device$'; then
+      printf '%s' "$ADB_LAN"; return 0
+    fi
+  fi
+  return 1
+}
+
 mms_rearm() {
-  [[ -n $ADB_SERIAL ]] || return 0
-  adb -s "$ADB_SERIAL" get-state 2>/dev/null | grep -q '^device$' || return 0
+  local target
+  target=$(adb_target) || return 0
 
   local now last=0
   now=$(date +%s)
@@ -267,10 +286,10 @@ mms_rearm() {
   (( now - last < MMS_REARM_MIN )) && return 0
   echo "$now" >"$MMS_REARM_STAMP"
 
-  log "re-arming motomms bridge over adb"
+  log "re-arming motomms bridge over adb ($target)"
   # -f 0x20 = FLAG_INCLUDE_STOPPED_PACKAGES; a force-stopped app is exactly the
   # case we are recovering from, and broadcasts are dropped to it otherwise.
-  adb -s "$ADB_SERIAL" shell am broadcast -a "$MMS_PKG.START" \
+  adb -s "$target" shell am broadcast -a "$MMS_PKG.START" \
       -n "$MMS_PKG/.BootReceiver" -f 0x20 >/dev/null 2>&1 ||
     log "re-arm broadcast failed"
 }
