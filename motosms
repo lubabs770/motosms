@@ -231,6 +231,22 @@ mms_get() { phone "curl -s --max-time 60 'http://127.0.0.1:$MMS_PORT$1'"; }
 # JPEG bytes through it are asking for trouble.
 mms_get_binary() { phone "curl -s --max-time 120 'http://127.0.0.1:$MMS_PORT$1' | base64 -w0" | base64 -d; }
 
+# Inbound pictures fail silently if the phone-side bridge is gone (the app is
+# stopped by any APK upgrade and nothing restarts it), so say so once per outage
+# rather than every tick. Text is unaffected — it needs no app.
+MMS_DOWN_FLAG="$STATE_DIR/mms-bridge-down"
+mms_down() {
+  [[ -e $MMS_DOWN_FLAG ]] && return 0
+  : >"$MMS_DOWN_FLAG"
+  log "motomms bridge UNREACHABLE on port $MMS_PORT - inbound pictures are stalled." \
+      "re-arm: adb shell am broadcast -a com.lubabs770.motomms.START -n com.lubabs770.motomms/.BootReceiver -f 0x20"
+}
+mms_up() {
+  [[ -e $MMS_DOWN_FLAG ]] || return 0
+  rm -f "$MMS_DOWN_FLAG"
+  log "motomms bridge back up"
+}
+
 # Polls the MMS provider for messages newer than last-mms-id, saves each image
 # part under $DATA_DIR/media/<mmsid>/, and dispatches one envelope per message
 # in the same shape as an SMS (plus a "media" array of local paths).
@@ -241,14 +257,15 @@ mms_poll() {
   # First run: adopt the current max so old picture threads are not replayed.
   if [[ -z $last ]]; then
     last=$(mms_get /health 2>/dev/null | jq -r '.maxMmsId // empty' 2>/dev/null)
-    [[ $last =~ ^[0-9]+$ ]] || return 0        # bridge down; try again next tick
+    [[ $last =~ ^[0-9]+$ ]] || { mms_down; return 0; }
     echo "$last" >"$LAST_MMS_FILE"
     log "watch: mms baseline id=$last"
     return 0
   fi
 
   batch=$(mms_get "/mms/list?since=$last&limit=10" 2>/dev/null)
-  jq -e '.ok == true' >/dev/null 2>&1 <<<"$batch" || return 0
+  jq -e '.ok == true' >/dev/null 2>&1 <<<"$batch" || { mms_down; return 0; }
+  mms_up
   [[ $(jq '.messages | length' <<<"$batch") -gt 0 ]] || return 0
 
   local m id from text dir paths ext out pid ct new_max=$last
