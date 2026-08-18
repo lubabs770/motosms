@@ -7,3 +7,7 @@ allow
 *.log
 *.jpg
 *.png
+
+# Local helpers and byproducts that are not part of this project
+__pycache__/
+mail-notify
