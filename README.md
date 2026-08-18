@@ -123,3 +123,7 @@ autostarted via Termux:Boot, and the Termux:API app granted `SEND_SMS` /
 - **Play Store auto-update is a hazard.** It force-stopped the default SMS app
   for minutes mid-test, which silently drops text and pictures. Blocked with
   `cmd netpolicy add restrict-background-blacklist <play-uid>`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
