@@ -8,6 +8,35 @@ reply back. Pictures work in both directions. Nothing touches a cloud relay.
 See [docs/locked-down-phone.md](docs/locked-down-phone.md) for how this fits with
 the other repos aimed at the same phone, and why each one exists.
 
+## Read this before you run it
+
+**An inbound text message executes arbitrary code on your box, as you.**
+`on-received` hands the message body to `claude -p` with
+`--dangerously-skip-permissions`, so Claude may run Bash, write files and reach
+the network without prompting. That is deliberate here — the whole point is a
+useful assistant reachable from a phone with no browser — but it means the
+trust boundary is one line long.
+
+The only thing standing between a text and a shell on your machine is the
+sender number matching `~/motosms/allow`. **Caller ID on SMS is not
+authentication.** Originating numbers are spoofable through ordinary bulk-SMS
+providers, and neither this bridge nor the carrier can tell a spoofed sender
+from the real one. Treat the allow-list as a convenience filter, not a
+credential.
+
+If you adopt this, consider at least:
+
+- Keep the allow-list to numbers you control, and never widen it casually.
+- Require a shared secret in the message body, so a spoofed number alone is not
+  enough. Cheap to add in `on-received` before the `claude` call.
+- Drop `--dangerously-skip-permissions` and pass an explicit allowed-tools set
+  instead, if you do not actually need unattended writes.
+- Run the handler as a dedicated low-privilege user rather than your own login.
+- Stop the watcher when you are not expecting to use it.
+
+Also note the phone is a full relay: anyone with physical access to it, or to a
+Termux session on it, is inside the boundary too.
+
 ## Shape
 
     ~/motosms/motosms        the bridge (bash)   -> symlinked to ~/.local/bin/motosms
