@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""motosms-webhook — receive inbound SMS pushed by the sms-gate app on the Moto.
+
+The phone POSTs here over the tailnet the moment a text arrives, so there is no
+polling loop and no ssh. Each accepted message is normalised into exactly the
+envelope ./on-received already expects from the ssh bridge, so the handler, the
+convo state and the . commands are shared between both transports.
+
+Deliberately stdlib-only: this runs unattended under launchd and should not be
+able to break because a pip package moved.
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOME = os.path.expanduser("~")
+MOTOSMS_HOME = os.environ.get("MOTOSMS_HOME") or os.path.dirname(os.path.realpath(__file__))
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state"), "motosms")
+DATA = os.path.join(os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share"), "motosms")
+HANDLER = os.path.join(MOTOSMS_HOME, "on-received")
+ALLOW_FILE = os.path.join(MOTOSMS_HOME, "allow")
+SEEN_FILE = os.path.join(STATE, "webhook-seen")
+LOG = os.path.join(DATA, "webhook.log")
+
+os.makedirs(STATE, exist_ok=True)
+os.makedirs(DATA, exist_ok=True)
+
+# Signatures are only good for a few minutes, so a captured POST cannot be
+# replayed later to re-run the handler.
+MAX_SKEW = 300
+
+
+def load_env(path):
+    """Parse the shell env file well enough for KEY=VALUE lines."""
+    cfg = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                v = v.split("#")[0].strip().strip("'\"")
+                cfg[k.strip()] = v
+    except OSError:
+        pass
+    return cfg
+
+
+CFG = load_env(os.path.join(MOTOSMS_HOME, "env"))
+BIND = CFG.get("WEBHOOK_BIND") or "127.0.0.1"
+PORT = int(CFG.get("WEBHOOK_PORT") or 8095)
+SIGNING_KEY = CFG.get("WEBHOOK_SIGNING_KEY") or ""
+PHONE_IP = re.sub(r"^https?://", "", CFG.get("GATEWAY_URL") or "").split(":")[0]
+
+_lock = threading.Lock()
+
+
+def log(msg):
+    line = f"{datetime.now().strftime('%F %T')} {msg}\n"
+    with _lock:
+        with open(LOG, "a") as fh:
+            fh.write(line)
+    sys.stderr.write(line)
+    sys.stderr.flush()
+
+
+def last10(number):
+    return re.sub(r"\D", "", number or "")[-10:]
+
+
+def allowed(number):
+    """Fail closed, and compare on the last ten digits like the bash bridge."""
+    want = last10(number)
+    if not want:
+        return False
+    try:
+        with open(ALLOW_FILE) as fh:
+            for line in fh:
+                line = line.split("#")[0].strip()
+                if line and last10(line) == want:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def seen(message_id):
+    """Webhook deliveries are retried; without this a retry re-runs Claude."""
+    if not message_id:
+        return False
+    with _lock:
+        try:
+            with open(SEEN_FILE) as fh:
+                ids = fh.read().split()
+        except OSError:
+            ids = []
+        if message_id in ids:
+            return True
+        ids.append(message_id)
+        with open(SEEN_FILE, "w") as fh:
+            fh.write("\n".join(ids[-500:]))
+    return False
+
+
+def verify(body, timestamp, signature):
+    if not SIGNING_KEY:
+        return None  # unsigned: caller falls back to source-IP checking
+    if not timestamp or not signature:
+        return False
+    try:
+        if abs(time.time() - int(timestamp)) > MAX_SKEW:
+            log("reject: timestamp outside the replay window")
+            return False
+    except ValueError:
+        return False
+    expected = hmac.new(SIGNING_KEY.encode(), body + timestamp.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def dispatch(event, payload):
+    """Normalise to the ssh bridge's envelope and hand it to ./on-received."""
+    sender = payload.get("sender") or ""
+    body = payload.get("message") or ""
+    mid = payload.get("messageId") or ""
+
+    if event == "mms:received":
+        # sms-gate reports that a picture arrived but keeps the parts on the
+        # device; fetching them needs motomms, which is loopback-only and so
+        # needs ssh. Record it rather than pretending it was delivered.
+        log(f"MMS from {sender} — metadata only, parts stay on the phone (needs ssh + motomms)")
+        return
+
+    if seen(mid):
+        log(f"duplicate delivery {mid} ignored")
+        return
+
+    envelope = {
+        "number": sender,
+        "address": sender,
+        "body": body,
+        "_id": mid,
+        "type": "sms",
+        "receivedAt": payload.get("receivedAt") or datetime.now(timezone.utc).isoformat(),
+    }
+
+    with _lock:
+        with open(os.path.join(DATA, "inbox.jsonl"), "a") as fh:
+            fh.write(json.dumps(envelope) + "\n")
+        with open(os.path.join(DATA, "received.log"), "a") as fh:
+            fh.write(f"{datetime.now().strftime('%F %T')}  <{sender}>  {body}\n")
+
+    if not allowed(sender):
+        log(f"DROPPED (not allow-listed): {sender}")
+        return
+    if not os.access(HANDLER, os.X_OK):
+        log(f"no executable handler at {HANDLER}; message only logged")
+        return
+
+    log(f"-> handler: <{sender}> {body[:80]}")
+    env = dict(os.environ, MOTOSMS_BIN=os.path.join(MOTOSMS_HOME, "motosms-gw"))
+    try:
+        proc = subprocess.run(
+            [HANDLER], input=json.dumps(envelope).encode(), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600,
+        )
+        if proc.returncode:
+            log(f"handler rc={proc.returncode}: {proc.stdout.decode(errors='replace')[-400:]}")
+    except subprocess.TimeoutExpired:
+        log("handler timed out after 600s")
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "motosms-webhook"
+
+    def log_message(self, *_):
+        pass  # our own logging, not stderr noise per request
+
+    def do_GET(self):
+        if self.path == "/healthz":
+            self._reply(200, b'{"ok":true}')
+        else:
+            self._reply(404, b"")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length)
+        client = self.client_address[0]
+
+        ok = verify(body, self.headers.get("X-Timestamp"), self.headers.get("X-Signature"))
+        if ok is False:
+            log(f"reject: bad signature from {client}")
+            self._reply(401, b'{"error":"bad signature"}')
+            return
+        if ok is None and PHONE_IP and client != PHONE_IP:
+            # No signing key configured, so the only thing vouching for this
+            # request is where it came from.
+            log(f"reject: unsigned POST from {client}, expected {PHONE_IP}")
+            self._reply(403, b'{"error":"unexpected source"}')
+            return
+
+        try:
+            data = json.loads(body)
+        except ValueError:
+            self._reply(400, b'{"error":"bad json"}')
+            return
+
+        # Answer immediately: the gateway retries on non-2xx, and Claude can
+        # take minutes to think. Do the work on another thread.
+        self._reply(200, b'{"ok":true}')
+
+        event = data.get("event") or ""
+        payload = data.get("payload") or {}
+        if event in ("sms:received", "mms:received"):
+            threading.Thread(target=dispatch, args=(event, payload), daemon=True).start()
+        else:
+            log(f"event {event or '(none)'} ignored")
+
+    def _reply(self, code, body):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+
+if __name__ == "__main__":
+    mode = "signed" if SIGNING_KEY else f"unsigned (source must be {PHONE_IP or '?'})"
+    log(f"listening on {BIND}:{PORT} [{mode}]")
+    try:
+        ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
+    except OSError as exc:
+        log(f"cannot bind {BIND}:{PORT}: {exc}")
+        sys.exit(1)

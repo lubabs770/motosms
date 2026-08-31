@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# motosms-gw — SMS bridge to the Moto G7 over the sms-gate HTTP API.
+#
+#   motosms-gw send <number> [text...]   # text may also come on stdin
+#   motosms-gw status                    # phone health, webhook, listener
+#   motosms-gw hooks                     # list registered webhooks
+#   motosms-gw register                  # (re)register this Mac's webhook
+#   motosms-gw unregister                # remove it
+#   motosms-gw tail [n]                  # human log
+#
+# Unlike ./motosms this needs no ssh: the sms-gate app on the phone exposes an
+# HTTP API on the tailnet, and pushes inbound messages to ./motosms-webhook.
+# Text only — sms-gate cannot send MMS and will not surrender inbound
+# attachments, so pictures still require the ssh transport plus motomms.
+
+set -uo pipefail
+
+# bash 4+ (mapfile, ${x,,}); macOS ships 3.2, so re-exec under a newer one.
+if ((BASH_VERSINFO[0] < 4)); then
+  for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [[ -x $b ]] && exec "$b" "$0" "$@"
+  done
+  printf 'motosms-gw: needs bash 4+ (brew install bash)\n' >&2; exit 1
+fi
+
+MOTOSMS_HOME="${MOTOSMS_HOME:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/motosms"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/motosms"
+ENV_FILE="$MOTOSMS_HOME/env"
+LOG="$DATA_DIR/motosms.log"
+
+mkdir -p "$STATE_DIR" "$DATA_DIR"
+# shellcheck source=/dev/null
+[[ -r $ENV_FILE ]] && . "$ENV_FILE"
+
+: "${GATEWAY_URL:=}"
+: "${GATEWAY_USER:=sms}"
+: "${GATEWAY_PASS:=}"
+: "${WEBHOOK_ID:=motosms-mac}"
+: "${WEBHOOK_URL:=}"
+: "${MAXCHARS:=3800}"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+die() { printf 'motosms-gw: %s\n' "$*" >&2; exit 1; }
+
+need_creds() {
+  [[ -n $GATEWAY_URL  ]] || die "GATEWAY_URL is unset; set it in $ENV_FILE"
+  [[ -n $GATEWAY_PASS ]] || die "GATEWAY_PASS is empty in $ENV_FILE.
+It is the sms-gate app's local-server password (Settings > Local server).
+Without it the phone rejects every call but /health."
+}
+
+# api <method> <path> [json-body] -> echoes body, sets API_CODE
+API_CODE=0
+api() {
+  local m=$1 p=$2 body=${3:-} out
+  local args=(-sS -m 30 -u "$GATEWAY_USER:$GATEWAY_PASS" -X "$m" -w $'\n%{http_code}')
+  [[ -n $body ]] && args+=(-H 'Content-Type: application/json' -d "$body")
+  out=$(curl "${args[@]}" "$GATEWAY_URL$p" 2>&1) || { API_CODE=0; printf '%s' "$out"; return 1; }
+  API_CODE=${out##*$'\n'}
+  printf '%s' "${out%$'\n'*}"
+}
+
+# Fold to GSM-7 by delegating to the upstream script, so there is exactly one
+# implementation of the carrier's constraint.
+fold_gsm7() { "$MOTOSMS_HOME/motosms" gsm7; }
+
+cmd_send() {
+  need_creds
+  local number=${1:-}; shift || true
+  [[ -n $number ]] || die "usage: motosms-gw send <number> [text...]"
+  [[ $number =~ ^\+?[0-9]+$ ]] || die "bad number: $number"
+  [[ $number == +* ]] || number="+$number"
+
+  local text
+  if (($#)); then text="$*"; else text=$(cat); fi
+  text=$(printf '%s' "$text" | fold_gsm7)
+  text=${text%$'\n'}
+  [[ -n $text ]] || die "empty message after GSM-7 filtering"
+
+  if ((${#text} > MAXCHARS)); then
+    log "truncating ${#text} -> $MAXCHARS chars"
+    text=${text:0:MAXCHARS}
+  fi
+
+  local body out
+  body=$(jq -nc --arg t "$text" --arg n "$number" \
+          '{textMessage:{text:$t}, phoneNumbers:[$n]}')
+  out=$(api POST /message "$body")
+
+  if [[ $API_CODE == 20* ]]; then
+    log "sent to $number (${#text} chars, id=$(jq -r '.id // "?"' <<<"$out" 2>/dev/null))"
+    printf 'sent to %s (%d chars, via gateway)\n' "$number" "${#text}"
+  else
+    log "SEND FAILED to $number http=$API_CODE: $out"
+    die "send failed (http $API_CODE): $out"
+  fi
+}
+
+cmd_hooks() { need_creds; api GET /webhooks | jq . 2>/dev/null || true; }
+
+cmd_register() {
+  need_creds
+  [[ -n $WEBHOOK_URL ]] || die "WEBHOOK_URL is unset in $ENV_FILE"
+  local body out
+  body=$(jq -nc --arg id "$WEBHOOK_ID" --arg url "$WEBHOOK_URL" \
+          '{id:$id, url:$url, event:"sms:received"}')
+  out=$(api POST /webhooks "$body")
+  if [[ $API_CODE == 20* ]]; then
+    printf 'registered %s -> %s\n' "$WEBHOOK_ID" "$WEBHOOK_URL"
+    log "webhook registered: $WEBHOOK_URL"
+  else
+    die "register failed (http $API_CODE): $out"
+  fi
+}
+
+cmd_unregister() {
+  need_creds
+  api DELETE "/webhooks/$WEBHOOK_ID" >/dev/null
+  [[ $API_CODE == 20* ]] && printf 'removed %s\n' "$WEBHOOK_ID" || die "delete failed (http $API_CODE)"
+}
+
+cmd_status() {
+  local h
+  h=$(curl -sS -m 10 "$GATEWAY_URL/health" 2>/dev/null)
+  if [[ -n $h ]] && jq -e . >/dev/null 2>&1 <<<"$h"; then
+    jq -r '"gateway   : " + .status + " (sms-gate " + .version + ")",
+           "battery   : \(.checks."battery:level".observedValue)%" +
+             (if .checks."battery:charging".observedValue == 1 then " charging" else " ON BATTERY" end),
+           "internet  : \(if .checks."connection:status".observedValue == 1 then "up" else "DOWN" end)",
+           "failed/hr : \(.checks."messages:failed".observedValue)"' <<<"$h"
+  else
+    printf 'gateway   : UNREACHABLE at %s\n' "$GATEWAY_URL"
+  fi
+
+  local st
+  st=$(launchctl print "gui/$(id -u)/com.lubabs770.motosms.webhook" 2>/dev/null |
+       awk '/^\tstate = /{print $3}')
+  printf 'listener  : %s\n' "${st:-not loaded}"
+  printf 'webhook   : %s\n' "${WEBHOOK_URL:-unset}"
+  if [[ -n $GATEWAY_PASS ]]; then
+    local hooks; hooks=$(api GET /webhooks)
+    printf 'registered: %s\n' "$(jq -r 'if type=="array" then (map(.url)|join(", ")) else "?" end' <<<"$hooks" 2>/dev/null || echo '?')"
+  else
+    printf 'registered: unknown (GATEWAY_PASS empty)\n'
+  fi
+  printf 'allow     : %s entries\n' "$(grep -cvE '^[[:space:]]*(#|$)' "$MOTOSMS_HOME/allow" 2>/dev/null || echo 0)"
+}
+
+cmd_tail() { tail -n "${1:-20}" "$DATA_DIR/received.log" 2>/dev/null; }
+
+case "${1:-}" in
+  send)       shift; cmd_send "$@" ;;
+  status)     shift; cmd_status ;;
+  hooks)      shift; cmd_hooks ;;
+  register)   shift; cmd_register ;;
+  unregister) shift; cmd_unregister ;;
+  tail)       shift; cmd_tail "$@" ;;
+  ""|-h|--help|help) sed -n '2,12p' "$0" | sed 's/^# \?//' ;;
+  *) die "unknown command: $1 (try: send status hooks register unregister tail)" ;;
+esac
